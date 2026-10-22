@@ -77,11 +77,18 @@ class AlphaESSButton(ButtonEntity):
 
     async def async_press(self, **kwargs: Any) -> None:
         if self._key == "dispatch_reset":
+            from .switch import _MUTEX_SWITCHES
+
             switches = self.hass.data[DOMAIN].get(f"{self._entry_id}_switches", {})
-            peak = switches.get("peak_shaving")
-            if peak and (peak.is_on or peak.stopping):
-                # Drain its in-flight command before the explicit reset.
-                await peak.async_force_off()
+            # Stop every controller before resetting the device. Peak Shaving
+            # drains its in-flight command; legacy modes cancel queued updates.
+            # Include off switches because they can still have pending work.
+            for key, sw in switches.items():
+                if key in _MUTEX_SWITCHES:
+                    await sw.async_force_off()
+            self._coordinator.active_dispatch_key = None
+            self._coordinator.ee_paused = False
+            self._coordinator.fi_paused = False
             await self._coordinator.async_reset_dispatch()
         elif self._key == "synchronise_date_time":
             await self._coordinator.async_sync_datetime()

@@ -396,7 +396,7 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
         return DISPATCH_MODE_SOC_CONTROL
 
     async def async_force_off(self) -> None:
-        """Unconditionally mark this switch off and cancel its timers.
+        """Mark this switch off and drain its scheduled controller work.
 
         Used by other switches/buttons that need to clear state without
         triggering a full dispatch reset (which is the caller's responsibility).
@@ -406,6 +406,15 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
             self._coordinator.active_dispatch_key = None
         self._cancel_timer()
         self.async_write_ha_state()
+        # Unsubscribing prevents new callbacks, but callbacks may already have
+        # queued a write. Wait for cancellation before the caller sends reset.
+        # A controller task may itself request a stop: never cancel/await itself.
+        current = asyncio.current_task()
+        tasks = [task for task in self._pending_tasks if task is not current]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def async_force_on(self) -> None:
         """Unconditionally mark this switch on without starting any dispatch."""
@@ -510,6 +519,10 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
     # Force Export
     # ------------------------------------------------------------------
 
+    def _clamp_battery_power_w(self, power_w: float) -> float:
+        """Bound directional battery power before 32000-offset encoding."""
+        return max(0.0, min(power_w, float(self._coordinator.ac_limit_w), 32000.0))
+
     def _compute_force_export_power_raw(self, d: dict) -> int | None:
         """Return the dispatch active-power word for Force Export, or None if PV/load unavailable.
 
@@ -521,10 +534,13 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
         if house_load_w is None or pv_production_w is None:
             return None
         target_export_w = int(self._num("force_export_power", 5.0) * 1000)
-        battery_discharge_w = max(0, target_export_w + int(house_load_w) - int(pv_production_w))
+        battery_discharge_w = self._clamp_battery_power_w(
+            target_export_w + int(house_load_w) - int(pv_production_w)
+        )
         return int(32000 + battery_discharge_w)
 
     async def _write_export_dispatch(self, word: int, duration_s: int, *, reset_timer: bool) -> None:
+        word = int(32000 + self._clamp_battery_power_w(word - 32000))
         cutoff_soc = self._num("force_export_cutoff_soc", 4.0)
         soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
         await self._coordinator.async_write_dispatch([
@@ -585,13 +601,13 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
                 # No baseline yet (initial feed-forward was deferred). Seed from the
                 # feed-forward estimate if available, else assume discharge == target.
                 seed = self._compute_force_export_power_raw(d)
-                word = seed if seed is not None else int(32000 + max(0, target_w))
+                word = seed if seed is not None else int(32000 + self._clamp_battery_power_w(target_w))
             else:
                 # Servo: drive grid toward -target by trimming the discharge word.
                 # error > 0 means exporting too little, so discharge more.
                 error_w = float(grid) + target_w
                 new_discharge = (self._fe_last_power_raw - 32000) + _SERVO_GAIN * error_w
-                new_discharge = max(0.0, min(float(self._coordinator.ac_limit_w), new_discharge))
+                new_discharge = self._clamp_battery_power_w(new_discharge)
                 word = int(round(32000 + new_discharge))
             now = time.monotonic()
             changed = (
@@ -790,10 +806,13 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
         if house_load_w is None or pv_production_w is None:
             return None
         import_power_kw = self._num("force_import_power", 5.0)
-        charge_power_w = max(0, int(import_power_kw * 1000) - int(house_load_w) + int(pv_production_w))
+        charge_power_w = self._clamp_battery_power_w(
+            int(import_power_kw * 1000) - int(house_load_w) + int(pv_production_w)
+        )
         return int(32000 - charge_power_w)
 
     async def _write_import_dispatch(self, word: int, duration_s: int, *, reset_timer: bool) -> None:
+        word = int(32000 - self._clamp_battery_power_w(32000 - word))
         cutoff_soc = self._num("force_import_cutoff_soc", 100.0)
         soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
         await self._coordinator.async_write_dispatch([
@@ -841,13 +860,13 @@ class AlphaESSSwitch(RestoreEntity, SwitchEntity):
                 # No baseline yet (initial feed-forward was deferred). Seed from the
                 # feed-forward estimate if available, else assume charge == target.
                 seed = self._compute_force_import_power_raw(d)
-                word = seed if seed is not None else int(32000 - max(0, target_w))
+                word = seed if seed is not None else int(32000 - self._clamp_battery_power_w(target_w))
             else:
                 # Servo: drive grid toward +target by trimming the charge word.
                 # error > 0 means importing too little, so charge more.
                 error_w = target_w - float(grid)
                 new_charge = (32000 - self._fi_last_power_raw) + _SERVO_GAIN * error_w
-                new_charge = max(0.0, min(float(self._coordinator.ac_limit_w), new_charge))
+                new_charge = self._clamp_battery_power_w(new_charge)
                 word = int(round(32000 - new_charge))
             now = time.monotonic()
             changed = (
